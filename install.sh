@@ -14,7 +14,7 @@
 #                    Made with ❤ by ZenseiBabe
 #
 # Official Source Repository: https://github.com/mrrangerxd/aetherpanel
-# Universal Cross-Platform Installer, Updater & Node Pairer v4.0
+# Universal Cross-Platform Installer, Updater & Node Pairer v4.1
 # ==============================================================================
 
 # Ensure execution in GNU Bash 4.0+
@@ -34,6 +34,7 @@ set -Eeuo pipefail
 # ==============================================================================
 REPO_URL="https://github.com/mrrangerxd/aetherpanel"
 REPO_BRANCH="main"
+INSTALL_URL="https://raw.githubusercontent.com/MrRangerXD/AetherPanel/main/install.sh"
 DEFAULT_ROOT_INSTALL_DIR="/opt/aetherpanel"
 DEFAULT_USER_INSTALL_DIR="${HOME:-/tmp}/aetherpanel"
 INSTALL_DIR=""
@@ -45,7 +46,7 @@ PANEL_PORT="3000"
 DAEMON_PORT="9666"
 SFTP_PORT="2022"
 
-# Verified release acquisition (primary path). Source clone stays as fallback.
+# Verified release acquisition (only path). Source clone is a gated fallback.
 RELEASE_TAG="${AETHER_RELEASE_TAG:-latest-build}"
 DOWNLOAD_BASE="${AETHER_DOWNLOAD_BASE:-https://github.com/MrRangerXD/AetherPanel/releases/download/${RELEASE_TAG}}"
 PUBKEY_URL="${AETHER_PUBKEY_URL:-https://raw.githubusercontent.com/MrRangerXD/AetherPanel/main/keys/aetherpanel.pub}"
@@ -278,6 +279,12 @@ fetch_url() { # url dest -> 0 on success, removes partial file on failure
 url_exists() {
   command -v curl &>/dev/null || return 1
   curl -fsSI -o /dev/null -m 15 "$1" 2>/dev/null
+}
+
+# Is the source tree actually published at REPO_BRANCH?
+# The public repo may ship build artifacts only, in which case cloning is pointless.
+source_tree_published() {
+  url_exists "https://raw.githubusercontent.com/MrRangerXD/AetherPanel/${REPO_BRANCH}/package.json"
 }
 
 # ==============================================================================
@@ -1216,7 +1223,8 @@ download_panel_source() {
 
   # Verify source integrity (must have package.json)
   if [ ! -f "$TEMP_DIR/package.json" ]; then
-    echo -e "${RED}[ERROR] Downloaded repository archive is missing package.json.${NC}"
+    echo -e "${RED}[ERROR] Repository branch '${branch}' carries no package.json - it publishes artifacts only.${NC}"
+    echo -e "${YELLOW}        A verified release bundle is required (release needs SHA256SUMS + SHA256SUMS.minisig).${NC}"
     log_msg "ERROR: package.json missing in downloaded source"
     return 1
   fi
@@ -1253,7 +1261,14 @@ verify_release_manifest() {
 
   if command -v minisign &> /dev/null; then
     if ! fetch_url "$DOWNLOAD_BASE/SHA256SUMS.minisig" "$TEMP_DIR/SHA256SUMS.minisig"; then
+      if [ "$ALLOW_UNSIGNED" -eq 1 ]; then
+        echo -e "${YELLOW}[!] SHA256SUMS.minisig missing from release - continuing with checksum-only verification.${NC}"
+        log_msg "WARN: minisig missing, --allow-unsigned given, checksum-only"
+        return 0
+      fi
       echo -e "${RED}[ERROR] SHA256SUMS.minisig missing from release.${NC}"
+      echo -e "${YELLOW}        The manifest cannot be proven authentic. Re-run with --allow-unsigned to accept checksum-only.${NC}"
+      log_msg "ERROR: SHA256SUMS.minisig missing"
       return 1
     fi
     if ! fetch_url "$PUBKEY_URL" "$TEMP_DIR/aetherpanel.pub"; then
@@ -1336,7 +1351,7 @@ resolve_release_asset() {
   return 1
 }
 
-# Downloads + verifies + stages a bundle into $1. Returns 1 to signal "use source fallback".
+# Downloads + verifies + stages a bundle into $1. Returns 1 to signal "no bundle".
 fetch_verified_bundle() {
   local target_dir="${1:-$INSTALL_DIR}"
 
@@ -1914,7 +1929,7 @@ install_panel() {
   fi
   echo -e "${GREEN}[✓] Step 3 complete: GitHub connection verified.${NC}\n"
 
-  # [4/8] Acquiring the panel: verified release bundle first, source clone as fallback
+  # [4/8] Acquiring the panel: verified release bundle only, gated source fallback
   echo -e "${YELLOW}[4/8] Acquiring AetherPanel (verified release ${RELEASE_TAG})...${NC}"
   BUNDLE_OK=false
   if [ -n "$ARTIFACT_DIR" ]; then
@@ -1928,13 +1943,22 @@ install_panel() {
     echo -e "${GREEN}[✓] Verified bundle staged at ${INSTALL_DIR}.${NC}"
     BUNDLE_OK=true
   else
-    echo -e "${YELLOW}    [!] Verified bundle unavailable. Falling back to source clone (${REPO_BRANCH}).${NC}"
-    log_msg "WARN: bundle path failed, using source fallback"
-    if ! download_panel_source "$INSTALL_DIR" "$REPO_BRANCH"; then
-      echo -e "${RED}[FAILED] Installation halted at Step 4 (Acquisition). Check log: ${LOG_FILE}${NC}"
+    log_msg "WARN: bundle path failed"
+    if source_tree_published; then
+      echo -e "${YELLOW}    [!] Verified bundle unavailable - branch ${REPO_BRANCH} does publish source, falling back to clone.${NC}"
+      echo -e "${YELLOW}        (this path builds on the target and is not covered by release checksums)${NC}"
+      if ! download_panel_source "$INSTALL_DIR" "$REPO_BRANCH"; then
+        echo -e "${RED}[FAILED] Installation halted at Step 4 (Acquisition). Check log: ${LOG_FILE}${NC}"
+        return 1
+      fi
+      echo -e "${GREEN}[✓] Source staged (fallback path).${NC}"
+    else
+      echo -e "${RED}[FAILED] No verified bundle available and branch ${REPO_BRANCH} publishes no source tree.${NC}"
+      echo -e "${YELLOW}         Publish a signed release (SHA256SUMS + SHA256SUMS.minisig) or re-run with --allow-unsigned.${NC}"
+      echo -e "${YELLOW}         Release URL checked: ${DOWNLOAD_BASE}${NC}"
+      echo -e "${YELLOW}         Log: ${LOG_FILE}${NC}"
       return 1
     fi
-    echo -e "${GREEN}[✓] Source staged (fallback path).${NC}"
   fi
   echo -e "${GREEN}[✓] Step 4 complete.${NC}\n"
 
@@ -2395,9 +2419,14 @@ install_node_daemon() {
     if TEMP_DIR="" fetch_verified_bundle "$tmp_daemon" && [ -d "$tmp_daemon/daemon" ]; then
       cp -a "$tmp_daemon/daemon/"* "${node_cfg_dir}/" 2>/dev/null || true
       rm -rf "$tmp_daemon"
-    elif git clone --depth 1 "https://github.com/mrrangerxd/daemon" "$tmp_daemon" >> "$LOG_FILE" 2>&1; then
+    elif source_tree_published && git clone --depth 1 "$REPO_URL" "$tmp_daemon" >> "$LOG_FILE" 2>&1; then
       cp -a "$tmp_daemon"/* "${node_cfg_dir}/" 2>/dev/null || true
       rm -rf "$tmp_daemon"
+    else
+      echo -e "${YELLOW}    [!] Could not obtain daemon files - node agent not installed.${NC}"
+      log_msg "WARN: daemon files unavailable"
+      rm -rf "$tmp_daemon"
+      return 1
     fi
   fi
   find "$node_cfg_dir" -maxdepth 2 -name '*.ts' -delete 2>/dev/null || true
@@ -2473,7 +2502,7 @@ EOF
 }
 
 # ==============================================================================
-# 13. OPTION 3: UPDATE PANEL (VERIFIED RELEASE, SOURCE FALLBACK)
+# 13. OPTION 3: UPDATE PANEL (VERIFIED RELEASE, GATED SOURCE FALLBACK)
 # ==============================================================================
 update_panel() {
   detect_all_capabilities
@@ -2519,10 +2548,17 @@ update_panel() {
     git fetch origin >> "$LOG_FILE" 2>&1 || true
     git checkout "$REPO_BRANCH" >> "$LOG_FILE" 2>&1 || git checkout main >> "$LOG_FILE" 2>&1 || true
     git pull origin "$REPO_BRANCH" >> "$LOG_FILE" 2>&1 || git pull origin main >> "$LOG_FILE" 2>&1 || true
-  else
+  elif source_tree_published; then
     echo -e "${YELLOW}    [!] Bundle unavailable - falling back to source download.${NC}"
     staged="source"
-    download_panel_source "$target" "$REPO_BRANCH"
+    if ! download_panel_source "$target" "$REPO_BRANCH"; then
+      echo -e "${RED}[ERROR] Update aborted: no verified bundle and no source tree available.${NC}"
+      return 1
+    fi
+  else
+    echo -e "${RED}[ERROR] Update aborted: no verified bundle and branch ${REPO_BRANCH} publishes no source tree.${NC}"
+    echo -e "${YELLOW}        Publish a signed release (SHA256SUMS.minisig) or re-run with --allow-unsigned.${NC}"
+    return 1
   fi
 
   if [ "$staged" = "bundle" ]; then
@@ -2589,10 +2625,17 @@ reinstall_panel() {
       local reinstalled=""
       if fetch_verified_bundle "$INSTALL_DIR"; then
         reinstalled="bundle"
-      else
+      elif source_tree_published; then
         echo -e "${YELLOW}    [!] Bundle unavailable - falling back to source download.${NC}"
         reinstalled="source"
-        download_panel_source "$INSTALL_DIR" "$REPO_BRANCH"
+        if ! download_panel_source "$INSTALL_DIR" "$REPO_BRANCH"; then
+          echo -e "${RED}[ERROR] Reinstall aborted: no verified bundle and no source tree available.${NC}"
+          return 1
+        fi
+      else
+        echo -e "${RED}[ERROR] Reinstall aborted: no verified bundle and branch ${REPO_BRANCH} publishes no source tree.${NC}"
+        echo -e "${YELLOW}        Publish a signed release (SHA256SUMS.minisig) or re-run with --allow-unsigned.${NC}"
+        return 1
       fi
 
       echo -e "\n${YELLOW}[3/4] Restoring preserved database and environment...${NC}"
@@ -2717,10 +2760,12 @@ show_tutorial() {
   echo -e "   • ${BOLD}Ports 25565-30000/TCP/UDP:${NC} Minecraft & App Port Allocations\n"
   echo -e "${CYAN}3. Node Pairing One-Liner:${NC}"
   echo -e "   Run on remote compute node:"
-  echo -e "   ${BOLD}curl -fsSL ${REPO_URL}/raw/main/install.sh | bash -s -- --node --panel http://PANEL_IP:3000 --token TOKEN${NC}\n"
+  echo -e "   ${BOLD}curl -fsSL ${INSTALL_URL} | bash -s -- --node --panel http://PANEL_IP:3000 --token TOKEN${NC}\n"
   echo -e "${CYAN}4. Release Verification:${NC}"
   echo -e "   Every release ships SHA256SUMS + SHA256SUMS.minisig."
   echo -e "   ${BOLD}minisign -Vm SHA256SUMS -p aetherpanel.pub${NC} then ${BOLD}sha256sum -c SHA256SUMS${NC}\n"
+  echo -e "${CYAN}5. Unsigned Releases:${NC}"
+  echo -e "   ${BOLD}--allow-unsigned${NC} accepts checksum-only verification when a release has no signature.\n"
 
   prompt_input "Press Enter to return to main menu..." > /dev/null
 }
@@ -2972,7 +3017,7 @@ while [[ $# -gt 0 ]]; do
       echo -e "${CYAN}Release pinning / verification:${NC}"
       echo -e "  --release-tag TAG   install from a specific release tag (default: latest-build)"
       echo -e "  --commit SHA        refuse unless the release commit matches SHA"
-      echo -e "  --allow-unsigned    accept checksum-only verification (no minisign)"
+      echo -e "  --allow-unsigned    accept checksum-only verification (no minisign / no .minisig)"
       echo -e "  --from-artifact DIR install from an already verified bundle directory"
       exit 0
       ;;
@@ -3029,10 +3074,13 @@ while true; do
     7) repair_and_health_check ;;
     8)
       echo -e "\n${CYAN}Starting Admin User creation...${NC}"
-      if [ -d "$INSTALL_DIR" ]; then
-        (cd "$INSTALL_DIR" && npx tsx server/scripts/create-admin.ts)
+      if [ -f "${INSTALL_DIR}/server/scripts/create-admin.ts" ]; then
+        (cd "$INSTALL_DIR" && npx --yes tsx server/scripts/create-admin.ts)
+      elif [ -f "${INSTALL_DIR}/dist/server.cjs" ]; then
+        echo -e "${YELLOW}[!] create-admin script not bundled.${NC}"
+        echo -e "${YELLOW}    Run it from the source checkout, or create the first admin through the panel UI.${NC}"
       else
-        npx tsx server/scripts/create-admin.ts
+        echo -e "${RED}[ERROR] No installation found at ${INSTALL_DIR}.${NC}"
       fi
       prompt_input "Press Enter to return to menu..." > /dev/null
       ;;
